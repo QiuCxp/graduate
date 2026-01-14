@@ -6,17 +6,23 @@ import logging_mp
 logging_mp.basic_config(level=logging_mp.INFO)
 logger_mp = logging_mp.get_logger(__name__)
 
+import cv2
+import numpy as np
+
 import os 
 import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
+# Add unitree_sdk2py to path manually since it's not installed via pip
+sys.path.append('/home/qiuc/unitree_sdk2_python')
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize # dds 
 from televuer import TeleVuerWrapper
 from teleop.robot_control.robot_arm import G1_29_ArmController, G1_23_ArmController, H1_2_ArmController, H1_ArmController
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK
 from teleimager.image_client import ImageClient
+from teleop.vision.vision_client import VisionClient
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
@@ -118,6 +124,9 @@ if __name__ == '__main__':
         # image client
         img_client = ImageClient(host=args.img_server_ip)
         camera_config = img_client.get_cam_config()
+        # Force disable WebRTC on the client side to ensure we use the local image processing path (Burn-In Overlay)
+        camera_config['head_camera']['enable_webrtc'] = False
+        
         logger_mp.debug(f"Camera config: {camera_config}")
         xr_need_local_img = not (args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
 
@@ -156,6 +165,10 @@ if __name__ == '__main__':
         elif args.arm == "H1":
             arm_ik = H1_ArmIK()
             arm_ctrl = H1_ArmController(simulation_mode=args.sim)
+
+        # Vision Integration
+        # Vision Service runs locally (sidecar), connecting via Host IP
+        vision_client = VisionClient(ip="192.168.123.112", port=55556)
 
         # end-effector
         if args.ee == "dex3":
@@ -256,15 +269,72 @@ if __name__ == '__main__':
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
         arm_ctrl.speed_gradual_max()
+        
+        # Cache for latest detections
+        latest_detections = []
+        last_log_time = 0
+
         # main loop. robot start to follow VR user's motion
         while not STOP:
             start_time = time.time()
-            # get image
+            
+            # 1. Get Visual Detections (Non-blocking)
+            raw_data = vision_client.get_latest_raw_data()
+            if raw_data is not None:
+                latest_detections = raw_data
+
+            # 2. Get Images
+            head_img = None
             if camera_config['head_camera']['enable_zmq']:
                 if args.record or xr_need_local_img:
+                    # head_img is a numpy array (H, W, 3) BGR usually
                     head_img, head_img_fps = img_client.get_head_frame()
-                if xr_need_local_img:
+                
+                if xr_need_local_img and head_img is not None:
+                    # [DEBUG] Force Burn-In Visual Confirmation
+                    h, w, _ = head_img.shape
+                    
+                    # 1. Flash a red border to verify drawing permissions
+                    cv2.rectangle(head_img, (10, 10), (w-10, h-10), (0, 0, 255), 3)
+                    
+                    # 2. Add Timestamp
+                    cv2.putText(head_img, f"IMG Source: ZMQ {time.time():.2f}", (50, 50), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                    
+                    # 3. Draw Bounding Boxes on head_img locally
+                    if latest_detections:
+                        # [DEBUG] Log detection count occasionally
+                        if time.time() - last_log_time > 2.0:
+                            logger_mp.info(f"Drawing {len(latest_detections)} boxes on HUD")
+                            last_log_time = time.time()
+                            
+                        for det in latest_detections:
+                            # det['box'] is xywh normalized [cx, cy, w, h]
+                            box = det.get('box', [])
+                            label = det.get('label', '?')
+                            conf = det.get('conf', 0)
+                            
+                            if len(box) == 4:
+                                cx, cy, bw, bh = box
+                                # Convert center-xywh to top-left-xy
+                                x1 = int((cx - bw/2) * w)
+                                y1 = int((cy - bh/2) * h)
+                                x2 = int((cx + bw/2) * w)
+                                y2 = int((cy + bh/2) * h)
+                                
+                                # Draw Rectangle (Green)
+                                cv2.rectangle(head_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                                # Draw Label
+                                caption = f"{label} {conf:.2f}"
+                                cv2.putText(head_img, caption, (x1, y1 - 10), 
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    elif time.time() - last_log_time > 2.0:
+                         logger_mp.info("[DEBUG] No detections to draw.")
+                         last_log_time = time.time()
+                         
+                    # 4. Send the painted image to VR
                     tv_wrapper.render_to_xr(head_img)
+
             if camera_config['left_wrist_camera']['enable_zmq']:
                 if args.record:
                     left_wrist_img, _ = img_client.get_left_wrist_frame()

@@ -22,4 +22,27 @@ __MACOSX/
 teleop/data/
 episode_0*
 .vscode/
+*.pkl*.pt
+
+# ignore python env + weights
+vision_env/
+*.pt
+
+# python venv
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+
+# logs & caches
+*.log
 *.pkl
+*.pt
+*.pth
+*.onnx
+*.engine
+*.cache
+
+# local scripts
+get-pip.py
