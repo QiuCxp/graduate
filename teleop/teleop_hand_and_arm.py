@@ -23,6 +23,7 @@ from teleop.robot_control.robot_arm import G1_29_ArmController, G1_23_ArmControl
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK
 from teleimager.image_client import ImageClient
 from teleop.vision.vision_client import VisionClient
+from teleop.vision.hud_renderer import HUDRenderer
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
@@ -168,7 +169,9 @@ if __name__ == '__main__':
 
         # Vision Integration
         # Vision Service runs locally (sidecar), connecting via Host IP
-        vision_client = VisionClient(ip="192.168.123.112", port=55556)
+        vision_client = VisionClient(ip="192.168.123.115", port=55556)
+        # HUD Renderer (for Sci-Fi visuals)
+        hud_renderer = HUDRenderer()
 
         # end-effector
         if args.ee == "dex3":
@@ -291,45 +294,12 @@ if __name__ == '__main__':
                     head_img, head_img_fps = img_client.get_head_frame()
                 
                 if xr_need_local_img and head_img is not None:
-                    # [DEBUG] Force Burn-In Visual Confirmation
-                    h, w, _ = head_img.shape
+                    # [Science Fiction HUD]
+                    # Delegate all drawing to the dedicated HUD renderer
+                    hud_renderer.draw_hud(head_img, latest_detections)
                     
-                    # 1. Flash a red border to verify drawing permissions
-                    cv2.rectangle(head_img, (10, 10), (w-10, h-10), (0, 0, 255), 3)
-                    
-                    # 2. Add Timestamp
-                    cv2.putText(head_img, f"IMG Source: ZMQ {time.time():.2f}", (50, 50), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-                    
-                    # 3. Draw Bounding Boxes on head_img locally
-                    if latest_detections:
-                        # [DEBUG] Log detection count occasionally
-                        if time.time() - last_log_time > 2.0:
-                            logger_mp.info(f"Drawing {len(latest_detections)} boxes on HUD")
-                            last_log_time = time.time()
-                            
-                        for det in latest_detections:
-                            # det['box'] is xywh normalized [cx, cy, w, h]
-                            box = det.get('box', [])
-                            label = det.get('label', '?')
-                            conf = det.get('conf', 0)
-                            
-                            if len(box) == 4:
-                                cx, cy, bw, bh = box
-                                # Convert center-xywh to top-left-xy
-                                x1 = int((cx - bw/2) * w)
-                                y1 = int((cy - bh/2) * h)
-                                x2 = int((cx + bw/2) * w)
-                                y2 = int((cy + bh/2) * h)
-                                
-                                # Draw Rectangle (Green)
-                                cv2.rectangle(head_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                                # Draw Label
-                                caption = f"{label} {conf:.2f}"
-                                cv2.putText(head_img, caption, (x1, y1 - 10), 
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                    elif time.time() - last_log_time > 2.0:
-                         logger_mp.info("[DEBUG] No detections to draw.")
+                    if latest_detections and time.time() - last_log_time > 2.0:
+                         logger_mp.info(f"Rendering HUD for {len(latest_detections)} objects")
                          last_log_time = time.time()
                          
                     # 4. Send the painted image to VR

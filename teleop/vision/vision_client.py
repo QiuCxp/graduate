@@ -21,36 +21,50 @@ class VisionClient:
         self.socket.connect(address)
         self.socket.setsockopt_string(zmq.SUBSCRIBE, '')
         # Only keep the last message to avoid lag
-        self.socket.setsockopt(zmq.CONFLATE, 1) 
+        self.socket.setsockopt(zmq.RCVHWM, 1)        # Set Receive High Water Mark to 1 to reduce buffer
+        # self.socket.setsockopt(zmq.CONFLATE, 1)    # CONFLATE works mostly for PULL/PUSH, sometimes issues with SUB 
         
     def get_latest_overlays(self):
         """
         Check for new data. Returns a list of Vuer objects if new data exists, else None.
+        Drains the queue to ensure we only get the absolute latest frame.
         """
-        try:
-            # Non-blocking receive
-            msg = self.socket.recv_string(flags=zmq.NOBLOCK)
-            detections = json.loads(msg)
+        latest_msg = None
+        while True:
+            try:
+                # Non-blocking receive
+                msg = self.socket.recv_string(flags=zmq.NOBLOCK)
+                latest_msg = msg # Keep updating until queue is empty
+            except zmq.Again:
+                break
+            except Exception as e:
+                # print(f"[VisionClient] Error: {e}")
+                break
+        
+        if latest_msg:
+            detections = json.loads(latest_msg)
             return self._format_overlays(detections)
-        except zmq.Again:
-            # No new data
-            return None
-        except Exception as e:
-            # print(f"[VisionClient] Error: {e}")
-            return None
+        return None
 
     def get_latest_raw_data(self):
         """
         Check for new data. Returns the raw detection list (dict) if new data exists, else None.
+        Drains the queue to ensure we only get the absolute latest frame.
         """
-        try:
-            # Non-blocking receive
-            msg = self.socket.recv_string(flags=zmq.NOBLOCK)
-            return json.loads(msg)
-        except zmq.Again:
-            return None
-        except Exception:
-            return None
+        latest_msg = None
+        while True:
+            try:
+                # Non-blocking receive
+                msg = self.socket.recv_string(flags=zmq.NOBLOCK)
+                latest_msg = msg # Keep updating until queue is empty
+            except zmq.Again:
+                break
+            except Exception as e:
+               break
+               
+        if latest_msg:
+            return json.loads(latest_msg)
+        return None
 
     def _format_overlays(self, detections):
         """

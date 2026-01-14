@@ -21,7 +21,7 @@ except ImportError as e:
 
 def main():
     parser = argparse.ArgumentParser(description="Independent Vision Service for XR Teleoperation")
-    parser.add_argument("--model", type=str, default="yolov8n.pt", help="Path to YOLO model (auto-downloaded if not found)")
+    parser.add_argument("--model", type=str, default="yolov8l-seg.pt", help="Path to YOLO model (auto-downloaded if not found)")
     parser.add_argument("--ip", type=str, default="192.168.123.164", help="IP address of the image server")
     parser.add_argument("--port", type=int, default=55555, help="ZMQ port of the head camera")
     parser.add_argument("--pub_port", type=int, default=55556, help="ZMQ port to publish detections")
@@ -75,7 +75,8 @@ def main():
                     continue
 
                 # Run Inference
-                results = model.predict(frame, verbose=False, conf=0.5)
+                # conf=0.25 is standard YOLO default. 0.5 was too high for household objects in varying light.
+                results = model.predict(frame, verbose=False, conf=0.25, iou=0.45)
                 
                 # Process Results
                 det_count = len(results[0].boxes)
@@ -84,17 +85,32 @@ def main():
                 if det_count > 0:
                     print(f"[{time.strftime('%H:%M:%S')}] I SEE {det_count} OBJECTS!")
                     
-                    for box in results[0].boxes:
+                    # Re-loop with index to get matching masks
+                    for i, box in enumerate(results[0].boxes):
                         cls_id = int(box.cls[0])
                         cls_name = model.names[cls_id]
                         conf = float(box.conf[0])
-                        # Use normalized coordinates (0-1) for xywh
-                        xywhn = box.xywhn[0].tolist()
-                        
+                        # Round box coordinates to 3 decimal places
+                        xywhn = np.round(box.xywhn[0].cpu().numpy(), 3).tolist()
+
+                        poly = []
+                        if results[0].masks is not None:
+                             # normalized segments [N, 2]
+                             if len(results[0].masks.xyn) > i:
+                                 # Downsample polygon: Take every 10th point
+                                 # A 3090 GPU is fast, but JSON serialization/drawing on weak CPU is slow.
+                                 # Reducing 500 points -> 50 points makes 0 visual difference but 10x faster.
+                                 raw_poly = results[0].masks.xyn[i]
+                                 if len(raw_poly) > 0:
+                                     step = max(1, len(raw_poly) // 50) # Target approx 50 points max
+                                     # Round to 3 decimal places to drastically reduce JSON size (text length)
+                                     poly = np.round(raw_poly[::step], 3).tolist()
+
                         detection_list.append({
                             "label": cls_name,
                             "conf": conf,
-                            "box": xywhn
+                            "box": xywhn,
+                            "polygon": poly
                         })
 
                         # Log interesting objects
