@@ -88,6 +88,13 @@ def main():
                     # Re-loop with index to get matching masks
                     for i, box in enumerate(results[0].boxes):
                         cls_id = int(box.cls[0])
+                        
+                        # [OPTIMIZATION] Whitelist Filtering
+                        # Only process: Person(0), Bottle(39), Cup(41), Dining Table(60)
+                        # This reduces JSON payload size and visual noise significantly.
+                        if cls_id not in [0, 39, 41, 60]:
+                            continue
+
                         cls_name = model.names[cls_id]
                         conf = float(box.conf[0])
                         # Round box coordinates to 3 decimal places
