@@ -32,7 +32,7 @@ kTopicDex3RightState = "rt/dex3/right/state"
 
 
 class Dex3_1_Controller:
-    def __init__(self, left_hand_array_in, right_hand_array_in, dual_hand_data_lock = None, dual_hand_state_array_out = None,
+    def __init__(self, left_hand_array_in, right_hand_array_in, left_trigger_value_in, right_trigger_value_in, dual_hand_data_lock = None, dual_hand_state_array_out = None,
                        dual_hand_action_array_out = None, fps = 100.0, Unit_Test = False, simulation_mode = False):
         """
         [note] A *_array type parameter requires using a multiprocessing Array, because it needs to be passed to the internal child process
@@ -40,6 +40,10 @@ class Dex3_1_Controller:
         left_hand_array_in: [input] Left hand skeleton data (required from XR device) to hand_ctrl.control_process
 
         right_hand_array_in: [input] Right hand skeleton data (required from XR device) to hand_ctrl.control_process
+
+        left_trigger_value_in: [input] Left trigger value
+
+        right_trigger_value_in: [input] Right trigger value
 
         dual_hand_data_lock: Data synchronization lock for dual_hand_state_array and dual_hand_action_array
 
@@ -90,7 +94,7 @@ class Dex3_1_Controller:
             logger_mp.warning("[Dex3_1_Controller] Waiting to subscribe dds...")
         logger_mp.info("[Dex3_1_Controller] Subscribe dds ok.")
 
-        hand_control_process = Process(target=self.control_process, args=(left_hand_array_in, right_hand_array_in,  self.left_hand_state_array, self.right_hand_state_array,
+        hand_control_process = Process(target=self.control_process, args=(left_hand_array_in, right_hand_array_in, left_trigger_value_in, right_trigger_value_in, self.left_hand_state_array, self.right_hand_state_array,
                                                                           dual_hand_data_lock, dual_hand_state_array_out, dual_hand_action_array_out))
         hand_control_process.daemon = True
         hand_control_process.start()
@@ -134,7 +138,7 @@ class Dex3_1_Controller:
         self.RightHandCmb_publisher.Write(self.right_msg)
         # logger_mp.debug("hand ctrl publish ok.")
     
-    def control_process(self, left_hand_array_in, right_hand_array_in, left_hand_state_array, right_hand_state_array,
+    def control_process(self, left_hand_array_in, right_hand_array_in, left_trigger_value_in, right_trigger_value_in, left_hand_state_array, right_hand_state_array,
                               dual_hand_data_lock = None, dual_hand_state_array_out = None, dual_hand_action_array_out = None):
         self.running = True
 
@@ -174,6 +178,11 @@ class Dex3_1_Controller:
         try:
             while self.running:
                 start_time = time.time()
+                
+                # Reset targets to open pose (0.0) at the start of each frame
+                left_q_target = np.zeros(Dex3_Num_Motors)
+                right_q_target = np.zeros(Dex3_Num_Motors)
+
                 # get dual hand state
                 with left_hand_array_in.get_lock():
                     left_hand_data  = np.array(left_hand_array_in[:]).reshape(25, 3).copy()
@@ -183,12 +192,39 @@ class Dex3_1_Controller:
                 # Read left and right q_state from shared arrays
                 state_data = np.concatenate((np.array(left_hand_state_array[:]), np.array(right_hand_state_array[:])))
 
+
                 if not np.all(right_hand_data == 0.0) and not np.all(left_hand_data[4] == np.array([-1.13, 0.3, 0.15])): # if hand data has been initialized.
                     ref_left_value = left_hand_data[self.hand_retargeting.left_indices[1,:]] - left_hand_data[self.hand_retargeting.left_indices[0,:]]
                     ref_right_value = right_hand_data[self.hand_retargeting.right_indices[1,:]] - right_hand_data[self.hand_retargeting.right_indices[0,:]]
 
-                    left_q_target  = self.hand_retargeting.left_retargeting.retarget(ref_left_value)[self.hand_retargeting.right_dex_retargeting_to_hardware]
+                    left_q_target  = self.hand_retargeting.left_retargeting.retarget(ref_left_value)[self.hand_retargeting.left_dex_retargeting_to_hardware]
+                    # Permute Left Hand Retargeting (T,T,T,M,M,I,I) to match Hardware Enum (T,T,T,I,I,M,M)
+                    # Indices: 0,1,2 (Thumbs) | 3,4 (Middles) | 5,6 (Indices)  --> Want: 0,1,2 | 5,6 (Indices) | 3,4 (Middles)
+                    left_q_target = left_q_target[[0, 1, 2, 5, 6, 3, 4]]
+
                     right_q_target = self.hand_retargeting.right_retargeting.retarget(ref_right_value)[self.hand_retargeting.right_dex_retargeting_to_hardware]
+
+                # Trigger Override Logic
+                left_trigger = left_trigger_value_in.value
+                right_trigger = right_trigger_value_in.value
+                
+                # Dex3 Joint Limits & Order Safelists
+                # Left Hand Enum Order: T0, T1, T2, I0, I1, M0, M1 (Updated to match Hardware/Right)
+                # Left Limits: T1(-0.72~0.92, Flex+), T2(0~1.74, Flex+), Fingers(Flex-)
+                # Safe Clench: T1=0.8, T2=1.5, I0/M0=-1.5, I1/M1=-1.5
+                left_close_pose = np.array([0.0, 0.8, 1.5, -1.5, -1.5, -1.5, -1.5]) 
+
+                # Right Hand Enum Order: T0, T1, T2, I0, I1, M0, M1 (Note: Index before Middle in Enum)
+                # Right Limits: T1(-0.92~0.72, Flex-), T2(-1.74~0, Flex-), Fingers(Flex+)
+                # Safe Clench: T1=-0.8, T2=-1.5, I0/M0=1.5, I1/M1=1.5
+                right_close_pose = np.array([0.0, -0.8, -1.5, 1.5, 1.5, 1.5, 1.5])
+                
+                # Apply Trigger Control (Linear Interpolation)
+                if left_trigger > 0.001:
+                    left_q_target = (1.0 - left_trigger) * left_q_target + left_trigger * left_close_pose
+                
+                if right_trigger > 0.001:
+                    right_q_target = (1.0 - right_trigger) * right_q_target + right_trigger * right_close_pose
 
                 # get dual hand action
                 action_data = np.concatenate((left_q_target, right_q_target))    
@@ -209,10 +245,10 @@ class Dex3_1_Left_JointIndex(IntEnum):
     kLeftHandThumb0 = 0
     kLeftHandThumb1 = 1
     kLeftHandThumb2 = 2
-    kLeftHandMiddle0 = 3
-    kLeftHandMiddle1 = 4
-    kLeftHandIndex0 = 5
-    kLeftHandIndex1 = 6
+    kLeftHandIndex0 = 3
+    kLeftHandIndex1 = 4
+    kLeftHandMiddle0 = 5
+    kLeftHandMiddle1 = 6
 
 class Dex3_1_Right_JointIndex(IntEnum):
     kRightHandThumb0 = 0
