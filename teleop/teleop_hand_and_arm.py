@@ -55,8 +55,12 @@ RECORD_TOGGLE  = False  # Toggle recording state
 #  ==> manual: when READY is True, set RECORD_TOGGLE=True to transition.
 #  --> auto  : Auto-transition after saving data.
 
+# [Task Selection]
+CURRENT_TASK_ID = 0 # 0: None, 1: Grasp, 2: Place, 3: Pour, 4: Navigate
+TASK_NOTIFY_START_TIME = 0.0 # Time when task was selected
+
 def on_press(key):
-    global STOP, START, RECORD_TOGGLE
+    global STOP, START, RECORD_TOGGLE, CURRENT_TASK_ID, TASK_NOTIFY_START_TIME
     if key == 'r':
         START = True
     elif key == 'q':
@@ -64,6 +68,10 @@ def on_press(key):
         STOP = True
     elif key == 's' and START == True:
         RECORD_TOGGLE = True
+    elif key in ['1', '2', '3', '4']:
+        CURRENT_TASK_ID = int(key)
+        TASK_NOTIFY_START_TIME = time.time()
+        logger_mp.info(f"Task Selected: {CURRENT_TASK_ID}")
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
 
@@ -178,10 +186,12 @@ if __name__ == '__main__':
             from teleop.robot_control.robot_hand_unitree import Dex3_1_Controller
             left_hand_pos_array = Array('d', 75, lock = True)      # [input]
             right_hand_pos_array = Array('d', 75, lock = True)     # [input]
+            left_trigger_value = Value('d', 0.0, lock=True)        # [input]
+            right_trigger_value = Value('d', 0.0, lock=True)       # [input]
             dual_hand_data_lock = Lock()
             dual_hand_state_array = Array('d', 14, lock = False)   # [output] current left, right hand state(14) data.
             dual_hand_action_array = Array('d', 14, lock = False)  # [output] current left, right hand action(14) data.
-            hand_ctrl = Dex3_1_Controller(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, 
+            hand_ctrl = Dex3_1_Controller(left_hand_pos_array, right_hand_pos_array, left_trigger_value, right_trigger_value, dual_hand_data_lock, 
                                           dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim)
         elif args.ee == "dex1":
             from teleop.robot_control.robot_hand_unitree import Dex1_1_Gripper_Controller
@@ -256,21 +266,84 @@ if __name__ == '__main__':
                                      rerun_log = not args.headless)
 
         logger_mp.info("----------------------------------------------------------------")
-        logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
+        logger_mp.info("�  Step 1: Select a Task [1-4] or [0] for None")
+        logger_mp.info("    [1] Grasp Fruit (Apple, Orange)")
+        logger_mp.info("    [2] Place Object")
+        logger_mp.info("    [3] Pour Water (Cup, Bottle)")
+        logger_mp.info("    [4] Navigate")
+        logger_mp.info("🟢  Step 2: Press [r] to start syncing the robot with your movements.")
         if args.record:
             logger_mp.info("🟡  Press [s] to START or SAVE recording (toggle cycle).")
         else:
             logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
         logger_mp.info("🔴  Press [q] to stop and exit the program.")
-        logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
+        logger_mp.info("----------------------------------------------------------------")
+
         READY = True                  # now ready to (1) enter START state
+        
+        # Task Selection Phase (before R is pressed)
+        logger_mp.info("WAITING FOR TASK SELECTION...")
         while not START and not STOP: # wait for start or stop signal.
             time.sleep(0.033)
+            
+            # Send Task ID to HUD via simple mechanism (simulated by updating vision client request later if needed)
+            # For now, we rely on the `vision_client` getting all data, and `hud_renderer` filtering by `CURRENT_TASK_ID`
+            # But we can print feedback here
+            if TASK_NOTIFY_START_TIME > 0 and (time.time() - TASK_NOTIFY_START_TIME) < 2.0:
+                 # Overlay task name is handled by HUD, but we can log console feedback
+                 pass
+
             if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                 head_img, _ = img_client.get_head_frame()
+                
+                # Render HUD with PREVIEW mode (Task Selection UI)
+                # We need to pass the CURRENT_TASK_ID to the HUD renderer somehow. 
+                # Since tv_wrapper.render_to_xr takes an image, we should overlay on head_img HERE.
+                
+                # Overlay Task Selection Menu on head_img
+                
+                # --- [HUD] Render Task Selector ---
+                # Draw a semi-transparent panel
+                h, w = head_img.shape[:2]
+                panel_h = 300
+                panel_w = 500
+                panel_x = (w - panel_w) // 2
+                panel_y = (h - panel_h) // 2
+                
+                overlay = head_img.copy()
+                cv2.rectangle(overlay, (panel_x, panel_y), (panel_x+panel_w, panel_y+panel_h), (0, 0, 0), -1)
+                cv2.addWeighted(overlay, 0.7, head_img, 0.3, 0, head_img)
+                
+                # Draw Title
+                cv2.putText(head_img, "SELECT MISSION", (panel_x + 130, panel_y + 50), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+                
+                # Draw Options
+                options = [
+                    (1, "POS MOVE"),    # Task 1: Book -> Cup
+                    (2, "CLEAN UP"),    # Task 2: Rescue Bottle
+                    (3, "HUMAN SAFETY"),# Task 3: Human Interaction
+                    (4, "NAVIGATION")
+                ]
+                
+                for i, (tid, name) in enumerate(options):
+                    color = (0, 255, 0) if CURRENT_TASK_ID == tid else (150, 150, 150)
+                    prefix = "> " if CURRENT_TASK_ID == tid else "  "
+                    cv2.putText(head_img, f"{prefix} [{tid}] {name}", (panel_x + 50, panel_y + 100 + i*40),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
+                # Draw Instructions
+                cv2.putText(head_img, "Press [1-4] to Select", (panel_x + 100, panel_y + 260),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                cv2.putText(head_img, "Press [r] to START", (panel_x + 115, panel_y + 285),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+
                 tv_wrapper.render_to_xr(head_img)
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
+        start_time = 0
+        if start_time == 0:
+            start_time = time.time()
         arm_ctrl.speed_gradual_max()
         
         # Cache for latest detections
@@ -295,11 +368,21 @@ if __name__ == '__main__':
                 
                 if xr_need_local_img and head_img is not None:
                     # [Science Fiction HUD]
-                    # Delegate all drawing to the dedicated HUD renderer
-                    hud_renderer.draw_hud(head_img, latest_detections)
+                    # Delegate all drawing to the dedicated HUD renderer, passing the currently selected task
+                    # IMPORTANT: Capture the return value, as render might return a processed copy
+                    head_img = hud_renderer.render(head_img, latest_detections, task_id=CURRENT_TASK_ID)
+
+                    # [Task Notification] - Keep showing what task we are in persistently or briefly?
+                    # The render() function might now handle general UI, but if we need a pop-up:
+                    if CURRENT_TASK_ID > 0 and (time.time() - TASK_NOTIFY_START_TIME) < 3.0:
+                         # Optional: Brief overlay if task changed mid-operation
+                         pass
                     
                     if latest_detections and time.time() - last_log_time > 2.0:
-                         logger_mp.info(f"Rendering HUD for {len(latest_detections)} objects")
+                         logger_mp.info(f"Rendering {len(latest_detections)} objects for Task {CURRENT_TASK_ID}")
+                         # Debug: print label of first object
+                         if len(latest_detections) > 0:
+                             logger_mp.info(f"First obj: {latest_detections[0].get('label')} at {latest_detections[0].get('box')}")
                          last_log_time = time.time()
                          
                     # 4. Send the painted image to VR
@@ -333,6 +416,21 @@ if __name__ == '__main__':
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
                 with right_hand_pos_array.get_lock():
                     right_hand_pos_array[:] = tele_data.right_hand_pos.flatten()
+                
+                if args.ee == "dex3":
+                    # Convert TeleData (10=Released, 0=Pressed) to (0=Open, 1=Closed)
+                    left_val = (10.0 - tele_data.left_ctrl_triggerValue) / 10.0
+                    right_val = (10.0 - tele_data.right_ctrl_triggerValue) / 10.0
+                    left_trigger_value.value = max(0.0, min(1.0, left_val))
+                    right_trigger_value.value = max(0.0, min(1.0, right_val))
+
+            elif args.ee == "dex3" and args.input_mode == "controller":
+                # Convert TeleData (10=Released, 0=Pressed) to (0=Open, 1=Closed)
+                left_val = (10.0 - tele_data.left_ctrl_triggerValue) / 10.0
+                right_val = (10.0 - tele_data.right_ctrl_triggerValue) / 10.0
+                left_trigger_value.value = max(0.0, min(1.0, left_val))
+                right_trigger_value.value = max(0.0, min(1.0, right_val))
+
             elif args.ee == "dex1" and args.input_mode == "controller":
                 with left_gripper_value.get_lock():
                     left_gripper_value.value = tele_data.left_ctrl_triggerValue

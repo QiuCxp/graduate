@@ -86,13 +86,14 @@ def main():
                     print(f"[{time.strftime('%H:%M:%S')}] I SEE {det_count} OBJECTS!")
                     
                     # Re-loop with index to get matching masks
+                    print(f"DEBUG: All detected Class IDs this frame: {[int(box.cls[0]) for box in results[0].boxes]}")
                     for i, box in enumerate(results[0].boxes):
                         cls_id = int(box.cls[0])
                         
                         # [OPTIMIZATION] Whitelist Filtering
-                        # Only process: Person(0), Bottle(39), Cup(41), Dining Table(60)
+                        # Only process: Person(0), Bottle(39), Cup(41), Apple(47), Orange(49), Book(73)
                         # This reduces JSON payload size and visual noise significantly.
-                        if cls_id not in [0, 39, 41, 60]:
+                        if cls_id not in [0, 39, 41, 47, 49, 73]:
                             continue
 
                         cls_name = model.names[cls_id]
