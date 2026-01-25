@@ -15,20 +15,19 @@ class HandType(Enum):
 
 class HandRetargeting:
     def __init__(self, hand_type: HandType):
-        if hand_type == HandType.UNITREE_DEX3:
-            RetargetingConfig.set_default_urdf_dir('../assets')
-        elif hand_type == HandType.UNITREE_DEX3_Unit_Test:
-            RetargetingConfig.set_default_urdf_dir('../../assets')
-        elif hand_type == HandType.INSPIRE_HAND:
-            RetargetingConfig.set_default_urdf_dir('../assets')
-        elif hand_type == HandType.INSPIRE_HAND_Unit_Test:
-            RetargetingConfig.set_default_urdf_dir('../../assets')
-        elif hand_type == HandType.BRAINCO_HAND:
-            RetargetingConfig.set_default_urdf_dir('../assets')
-        elif hand_type == HandType.BRAINCO_HAND_Unit_Test:
-            RetargetingConfig.set_default_urdf_dir('../../assets')
+        # Use absolute path for robustness
+        # file: teleop/robot_control/hand_retargeting.py -> root: xr_teleoperate/ -> assets: xr_teleoperate/assets/
+        xr_teleop_root = Path(__file__).resolve().parent.parent.parent
+        assets_dir = xr_teleop_root / "assets"
+        RetargetingConfig.set_default_urdf_dir(str(assets_dir))
 
-        config_file_path = Path(hand_type.value)
+        # Resolve config file path absolutely
+        val = hand_type.value
+        if "assets/" in val:
+            rel_path = val.split("assets/", 1)[1]
+            config_file_path = assets_dir / rel_path
+        else:
+            config_file_path = Path(val)
 
         try:
             with config_file_path.open('r') as f:
