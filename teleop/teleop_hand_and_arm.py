@@ -8,6 +8,7 @@ logger_mp = logging_mp.get_logger(__name__)
 
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 import os 
 import sys
@@ -28,6 +29,62 @@ from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
 from sshkeyboard import listen_keyboard, stop_listening
+
+_FONT_CACHE = {}
+_FONT_PATHS = [
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Light.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Light.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    "/usr/share/fonts/truetype/arphic/ukai.ttc",
+    "/usr/share/fonts/truetype/arphic/uming.ttc",
+]
+
+def _get_font(size):
+    if size in _FONT_CACHE:
+        return _FONT_CACHE[size]
+    for path in _FONT_PATHS:
+        try:
+            font = ImageFont.truetype(path, size)
+            _FONT_CACHE[size] = font
+            return font
+        except Exception:
+            continue
+    _FONT_CACHE[size] = None
+    return None
+
+def draw_text_cn(img, text, org, font_scale=0.6, color=(255, 255, 255), thickness=1):
+    if text is None:
+        return
+    font_size = max(12, int(22 * font_scale))
+    font = _get_font(font_size)
+    if font is None:
+        cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 1, cv2.LINE_AA)
+        return
+
+    bbox = font.getbbox(text)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    x, y = org
+    tl_x = x
+    tl_y = max(0, y - text_h)
+
+    x1 = max(0, tl_x)
+    y1 = max(0, tl_y)
+    x2 = min(img.shape[1], tl_x + text_w + 2)
+    y2 = min(img.shape[0], tl_y + text_h + 2)
+    if x1 >= x2 or y1 >= y2:
+        return
+
+    roi = img[y1:y2, x1:x2]
+    roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(roi_rgb)
+    draw = ImageDraw.Draw(pil_img)
+    draw.text((0, 0), text, font=font, fill=(color[2], color[1], color[0]))
+    roi_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    roi[:] = roi_bgr
 
 # for simulation
 from unitree_sdk2py.core.channel import ChannelPublisher
@@ -315,28 +372,24 @@ if __name__ == '__main__':
                 cv2.addWeighted(overlay, 0.7, head_img, 0.3, 0, head_img)
                 
                 # Draw Title
-                cv2.putText(head_img, "SELECT MISSION", (panel_x + 130, panel_y + 50), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+                draw_text_cn(head_img, "选择任务", (panel_x + 160, panel_y + 50), 1.0, (0, 255, 255), 2)
                 
                 # Draw Options
                 options = [
-                    (1, "POS MOVE"),    # Task 1: Book -> Cup
-                    (2, "CLEAN UP"),    # Task 2: Rescue Bottle
-                    (3, "HUMAN SAFETY"),# Task 3: Human Interaction
-                    (4, "NAVIGATION")
+                    (1, "位置移动"),    # Task 1: Book -> Cup
+                    (2, "清理"),        # Task 2: Rescue Bottle
+                    (3, "人员安全"),    # Task 3: Human Interaction
+                    (4, "导航")
                 ]
                 
                 for i, (tid, name) in enumerate(options):
                     color = (0, 255, 0) if CURRENT_TASK_ID == tid else (150, 150, 150)
                     prefix = "> " if CURRENT_TASK_ID == tid else "  "
-                    cv2.putText(head_img, f"{prefix} [{tid}] {name}", (panel_x + 50, panel_y + 100 + i*40),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+                    draw_text_cn(head_img, f"{prefix} [{tid}] {name}", (panel_x + 50, panel_y + 100 + i*40), 0.8, color, 2)
 
                 # Draw Instructions
-                cv2.putText(head_img, "Press [1-4] to Select", (panel_x + 100, panel_y + 260),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                cv2.putText(head_img, "Press [r] to START", (panel_x + 115, panel_y + 285),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+                draw_text_cn(head_img, "按 [1-4] 选择", (panel_x + 130, panel_y + 260), 0.6, (255, 255, 255), 1)
+                draw_text_cn(head_img, "按 [r] 开始", (panel_x + 150, panel_y + 285), 0.6, (0, 255, 255), 1)
 
                 tv_wrapper.render_to_xr(head_img)
 
