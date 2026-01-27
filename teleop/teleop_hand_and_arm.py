@@ -237,6 +237,13 @@ if __name__ == '__main__':
         vision_client = VisionClient(ip="192.168.123.115", port=55556)
         # HUD Renderer (for Sci-Fi visuals)
         hud_renderer = HUDRenderer()
+        head_depth_meta = {
+            "scale": camera_config['head_camera'].get("depth_scale", 0.001),
+            "intrinsics": camera_config['head_camera'].get("depth_intrinsics") or camera_config['head_camera'].get("intrinsics"),
+            "shape": camera_config['head_camera'].get("depth_shape"),
+            "eye": camera_config['head_camera'].get("depth_eye", "left"),
+        }
+        has_head_depth = camera_config['head_camera'].get("depth_zmq_port") is not None
 
         # end-effector
         if args.ee == "dex3":
@@ -340,6 +347,7 @@ if __name__ == '__main__':
         
         # Task Selection Phase (before R is pressed)
         logger_mp.info("WAITING FOR TASK SELECTION...")
+        last_head_img = None
         while not START and not STOP: # wait for start or stop signal.
             time.sleep(0.033)
             
@@ -352,6 +360,12 @@ if __name__ == '__main__':
 
             if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                 head_img, _ = img_client.get_head_frame()
+                if head_img is None:
+                    if last_head_img is None:
+                        continue
+                    head_img = last_head_img.copy()
+                else:
+                    last_head_img = head_img.copy()
                 
                 # Render HUD with PREVIEW mode (Task Selection UI)
                 # We need to pass the CURRENT_TASK_ID to the HUD renderer somehow. 
@@ -402,6 +416,7 @@ if __name__ == '__main__':
         # Cache for latest detections
         latest_detections = []
         last_log_time = 0
+        last_head_depth = None
 
         # main loop. robot start to follow VR user's motion
         while not STOP:
@@ -418,12 +433,26 @@ if __name__ == '__main__':
                 if args.record or xr_need_local_img:
                     # head_img is a numpy array (H, W, 3) BGR usually
                     head_img, head_img_fps = img_client.get_head_frame()
+                head_depth = None
+                if has_head_depth:
+                    head_depth, _ = img_client.get_head_depth()
+                if head_depth is not None:
+                    last_head_depth = head_depth
                 
+                if head_img is None and xr_need_local_img and last_head_img is not None:
+                    head_img = last_head_img.copy()
+                elif head_img is not None:
+                    last_head_img = head_img.copy()
+
+                if head_depth is None and last_head_depth is not None:
+                    head_depth = last_head_depth
+
                 if xr_need_local_img and head_img is not None:
                     # [Science Fiction HUD]
                     # Delegate all drawing to the dedicated HUD renderer, passing the currently selected task
                     # IMPORTANT: Capture the return value, as render might return a processed copy
-                    head_img = hud_renderer.render(head_img, latest_detections, task_id=CURRENT_TASK_ID)
+                    head_img = hud_renderer.render(head_img, latest_detections, task_id=CURRENT_TASK_ID,
+                                                   depth=head_depth, depth_meta=head_depth_meta)
 
                     # [Task Notification] - Keep showing what task we are in persistently or briefly?
                     # The render() function might now handle general UI, but if we need a pop-up:

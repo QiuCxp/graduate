@@ -68,6 +68,7 @@ class HUDRenderer:
         self._task3_enter_time = None
         self._task3_scan_start = None
         self._task3_scan_done = False
+        self._task3_warmup_done = False
         self._task3_profile_template = self._load_patient_profile_template()
         self._task3_profile_image = self._load_patient_profile_image()
         self._task2_enter_time = None
@@ -83,6 +84,16 @@ class HUDRenderer:
         # duration of showcase after scan line
         self._scan_showcase_duration = 1.8  # seconds total
         self._scan_showcase_step = 0.22     # seconds per object highlight
+
+        # Depth-based distance HUD
+        self._depth_eye = "left"
+        self._depth_scale = 0.001
+        self._depth_intrinsics = None
+        self._depth_shape = None
+        self._distance_min_m = 0.2
+        self._distance_max_m = 1.2
+        self._marker_hsv_lower = (18, 80, 140)
+        self._marker_hsv_upper = (45, 255, 255)
 
     def _get_font(self, size):
         if size in self._font_cache:
@@ -135,14 +146,14 @@ class HUDRenderer:
         roi_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
         roi[:] = roi_bgr
 
-    def render(self, image, detections, task_id=0): # For legacy compatibility with old entry point name if needed
-        return self.render_main(image, detections, task_id)
+    def render(self, image, detections, task_id=0, depth=None, depth_meta=None): # For legacy compatibility with old entry point name if needed
+        return self.render_main(image, detections, task_id, depth=depth, depth_meta=depth_meta)
 
     def draw_hud(self, image, detections):
         # Redirect old method to new logic (default to Task 0)
         return self.render_main(image, detections, task_id=0)
 
-    def render_main(self, image, detections, task_id=0):
+    def render_main(self, image, detections, task_id=0, depth=None, depth_meta=None):
         """
         Main render loop.
         task_id: 
@@ -153,13 +164,19 @@ class HUDRenderer:
         """
         h, w = image.shape[:2]
         
+        if depth_meta:
+            self._update_depth_meta(depth_meta, image.shape[:2])
+
         # --- Task Specific Dispatch ---
         if task_id == 1:
-            return self.render_task_arrange(image, detections)
+            img = self.render_task_arrange(image, detections)
+            return self._render_depth_distance_overlay(img, detections, depth)
         elif task_id == 2:
-            return self.render_task_crisis_response(image, detections)
+            img = self.render_task_crisis_response(image, detections)
+            return self._render_depth_distance_overlay(img, detections, depth)
         elif task_id == 3:
-            return self.render_task_human_interaction(image, detections)
+            img = self.render_task_human_interaction(image, detections)
+            return self._render_depth_distance_overlay(img, detections, depth)
 
         # Define relevant objects for each task
         target_labels = []
@@ -373,9 +390,7 @@ class HUDRenderer:
             self._task2_last_point = None
 
         if not detections:
-            self._task2_phase_start = None
-            self._task2_has_target = False
-            self._task2_confirmed = False
+            # Keep scan/analysis state to avoid restarting buffer/scan on brief misses
             self._task2_trail = []
             self._task2_last_point = None
             return image
@@ -432,10 +447,7 @@ class HUDRenderer:
         if is_toppled:
             # Effect: Red Alert (Stylized)
 
-            # Reset analysis flow while in danger
-            self._task2_phase_start = None
-            self._task2_has_target = False
-            self._task2_confirmed = False
+            # Keep analysis state while in danger to avoid restarting scan
 
             # 1) Pulsing red border
             pulse = 0.6 + 0.4 * (np.sin(time.time() * 2.5) * 0.5 + 0.5)
@@ -480,9 +492,7 @@ class HUDRenderer:
         
         if not cup_info:
             # Bottle is upright, but we need Cup to define the zone
-            self._task2_phase_start = None
-            self._task2_has_target = False
-            self._task2_confirmed = False
+            # Keep scan/analysis state to avoid restarting scan on brief misses
             # Draw Bottle (red contour + overlay)
             if bottle_info.get('det', {}).get('polygon'):
                 overlay = image.copy()
@@ -738,8 +748,8 @@ class HUDRenderer:
         # Task 3 entry buffer (VR warm-up)
         if self._task3_enter_time is None:
             self._task3_enter_time = time.time()
-            self._task3_scan_start = None
-            self._task3_scan_done = False
+            if not self._task3_scan_done:
+                self._task3_scan_start = None
         
         cup_info = None
         bottle_info = None
@@ -881,9 +891,11 @@ class HUDRenderer:
             # ---- END NEW ----
 
 
-        # --- 10s buffer: no HUD rendering ---
-        if (time.time() - self._task3_enter_time) < 10.0:
-            return image
+        # --- 10s buffer: no HUD rendering (run once per session) ---
+        if not self._task3_warmup_done:
+            if (time.time() - self._task3_enter_time) < 10.0:
+                return image
+            self._task3_warmup_done = True
 
         # --- BOTTLE ---
         bottle_center = None
@@ -1168,6 +1180,199 @@ class HUDRenderer:
         cv2.line(img, (x2, y2), (x2 - length, y2), color, 2)
         cv2.line(img, (x2, y2), (x2, y2 - length), color, 2)
 
+    def _update_depth_meta(self, depth_meta, image_shape):
+        if depth_meta is None:
+            return
+        eye = depth_meta.get("eye")
+        if eye in ("left", "right"):
+            self._depth_eye = eye
+        scale = depth_meta.get("scale")
+        if scale is not None:
+            try:
+                self._depth_scale = float(scale)
+            except Exception:
+                pass
+        intr = depth_meta.get("intrinsics")
+        if intr:
+            self._depth_intrinsics = intr
+        shape = depth_meta.get("shape")
+        if shape and len(shape) == 2:
+            self._depth_shape = (int(shape[0]), int(shape[1]))
+        elif self._depth_shape is None and image_shape:
+            self._depth_shape = (int(image_shape[0]), int(image_shape[1]))
+
+    def _render_depth_distance_overlay(self, image, detections, depth):
+        if image is None or depth is None or detections is None:
+            return image
+        if not isinstance(depth, np.ndarray) or depth.ndim < 2:
+            return image
+
+        h, w = image.shape[:2]
+        dh, dw = depth.shape[:2]
+        eye_w = w
+        eye_offset = 0
+        if dw * 2 == w:
+            eye_w = w // 2
+            eye_offset = 0 if self._depth_eye == "left" else eye_w
+
+        marker_center = self._find_marker_center(image, eye_offset, eye_w)
+        bottle = self._select_bottle_center(detections, w, h, eye_offset, eye_w)
+        if marker_center is None or bottle is None:
+            return image
+        bottle_center, bottle_box = bottle
+
+        if self._depth_intrinsics is None:
+            self._put_text(image, "深度内参缺失", (10, h - 30), 0.5, (0, 0, 255), 1)
+            return image
+
+        z_marker = self._sample_depth(depth, marker_center, (h, w), eye_offset, eye_w)
+        z_bottle = self._sample_depth(depth, bottle_center, (h, w), eye_offset, eye_w)
+        if z_marker is None or z_bottle is None:
+            self._put_text(image, "深度不可用", (10, h - 30), 0.5, (0, 0, 255), 1)
+            return image
+
+        p_marker = self._project_to_3d(marker_center, z_marker, depth.shape[:2], (h, w), eye_offset, eye_w)
+        p_bottle = self._project_to_3d(bottle_center, z_bottle, depth.shape[:2], (h, w), eye_offset, eye_w)
+        if p_marker is None or p_bottle is None:
+            return image
+
+        dist_m = float(np.linalg.norm(p_marker - p_bottle))
+        dist_cm = dist_m * 100.0
+
+        # Draw line + points
+        cv2.line(image, marker_center, bottle_center, (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.circle(image, marker_center, 6, (0, 255, 255), -1)
+        cv2.circle(image, bottle_center, 6, (0, 200, 0), -1)
+
+        mid_x = (marker_center[0] + bottle_center[0]) // 2
+        mid_y = (marker_center[1] + bottle_center[1]) // 2
+        self._put_text(image, f"{dist_cm:.1f}cm", (mid_x + 8, mid_y - 8), 0.7, (0, 255, 255), 2)
+
+        # Progress bar near bottle
+        bx, by, bw, bh = bottle_box
+        bar_x = min(w - 20, bx + bw // 2 + 15)
+        bar_y = max(10, by - 60)
+        self._draw_progress_bar(image, (bar_x, bar_y), 12, 120, dist_m)
+        return image
+
+    def _find_marker_center(self, image, eye_offset, eye_w):
+        h, w = image.shape[:2]
+        x1 = max(0, min(w - 1, eye_offset))
+        x2 = max(1, min(w, eye_offset + eye_w))
+        roi = image[:, x1:x2]
+        if roi.size == 0:
+            return None
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, self._marker_hsv_lower, self._marker_hsv_upper)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        mask = cv2.dilate(mask, kernel, iterations=1)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+        contour = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(contour) < 80:
+            return None
+        m = cv2.moments(contour)
+        if m["m00"] == 0:
+            return None
+        cx = int(m["m10"] / m["m00"]) + x1
+        cy = int(m["m01"] / m["m00"])
+        return (cx, cy)
+
+    def _select_bottle_center(self, detections, image_w, image_h, eye_offset, eye_w):
+        best = None
+        for det in detections:
+            label = det.get("label", "").lower()
+            if label != "bottle":
+                continue
+            box = det.get("box", [])
+            if len(box) != 4:
+                continue
+            cx = int(box[0] * image_w)
+            cy = int(box[1] * image_h)
+            conf = float(det.get("conf", 0.0))
+            if eye_w != image_w:
+                if not (eye_offset <= cx < eye_offset + eye_w):
+                    continue
+            if best is None or conf > best[0]:
+                best = (conf, (cx, cy, int(box[2] * image_w), int(box[3] * image_h)))
+        if best is None:
+            return None
+        _, (cx, cy, bw, bh) = best
+        return (cx, cy), (cx, cy, bw, bh)
+
+    def _sample_depth(self, depth, pt, image_shape, eye_offset, eye_w):
+        dx, dy = self._map_to_depth_coords(pt, depth.shape[:2], image_shape, eye_offset, eye_w)
+        if dx is None or dy is None:
+            return None
+        r = 3
+        x1 = max(0, dx - r)
+        x2 = min(depth.shape[1], dx + r + 1)
+        y1 = max(0, dy - r)
+        y2 = min(depth.shape[0], dy + r + 1)
+        patch = depth[y1:y2, x1:x2]
+        if patch.size == 0:
+            return None
+        valid = patch[patch > 0]
+        if valid.size < 5:
+            return None
+        z = float(np.median(valid))
+        if depth.dtype != np.float32 and depth.dtype != np.float64:
+            z *= self._depth_scale
+        return z
+
+    def _project_to_3d(self, pt, z, depth_shape, image_shape, eye_offset, eye_w):
+        intr = self._depth_intrinsics
+        if intr is None:
+            return None
+        fx = intr.get("fx")
+        fy = intr.get("fy")
+        cx = intr.get("ppx") if intr.get("ppx") is not None else intr.get("cx")
+        cy = intr.get("ppy") if intr.get("ppy") is not None else intr.get("cy")
+        if fx is None or fy is None or cx is None or cy is None:
+            return None
+        try:
+            fx = float(fx)
+            fy = float(fy)
+            cx = float(cx)
+            cy = float(cy)
+        except Exception:
+            return None
+        dx, dy = self._map_to_depth_coords(pt, depth_shape, image_shape, eye_offset, eye_w)
+        if dx is None or dy is None:
+            return None
+        X = (dx - cx) / fx * z
+        Y = (dy - cy) / fy * z
+        return np.array([X, Y, z], dtype=np.float32)
+
+    def _map_to_depth_coords(self, pt, depth_shape, image_shape, eye_offset, eye_w):
+        img_h, img_w = image_shape
+        dh, dw = depth_shape
+        x, y = pt
+        if dw == img_w:
+            dx = int(x * (dw / img_w))
+        elif dw == eye_w:
+            dx = int((x - eye_offset) * (dw / eye_w))
+        else:
+            dx = int(x * (dw / img_w))
+        dy = int(y * (dh / img_h))
+        if dx < 0 or dy < 0 or dx >= dw or dy >= dh:
+            return None, None
+        return dx, dy
+
+    def _draw_progress_bar(self, image, origin, width, height, dist_m):
+        x, y = origin
+        h, w = image.shape[:2]
+        x = max(0, min(w - width - 1, x))
+        y = max(0, min(h - height - 1, y))
+        cv2.rectangle(image, (x, y), (x + width, y + height), (80, 80, 80), 1)
+        ratio = (self._distance_max_m - dist_m) / max(1e-6, (self._distance_max_m - self._distance_min_m))
+        ratio = max(0.0, min(1.0, ratio))
+        fill_h = int(height * ratio)
+        color = (0, int(255 * ratio), int(255 * (1.0 - ratio)))
+        cv2.rectangle(image, (x + 1, y + height - fill_h), (x + width - 1, y + height), color, -1)
+
     def render_task_arrange(self, image, detections):
         """
         Task 1: Arrange Items (Move Bottle to Book's Right Side)
@@ -1224,9 +1429,7 @@ class HUDRenderer:
         if not bottle_info:
              self._task1_trail = []
              self._task1_last_point = None
-             self._task1_phase_start = None
-             self._task1_has_target = False
-             self._task1_confirmed = False
+             # Keep scan/analysis state to avoid restarting buffer/scan on brief misses
              if not book_info:
                  self._put_text(image, "等待瓶子和书本...", (w//2-100, h//2), 0.7, (255, 255, 255), 2)
              else:
@@ -1268,11 +1471,7 @@ class HUDRenderer:
 
         # --- Fake visual analysis phase handling ---
         has_target = target_center is not None
-        if not has_target:
-            self._task1_phase_start = None
-            self._task1_has_target = False
-            self._task1_confirmed = False
-        else:
+        if has_target:
             if not self._task1_confirmed and not self._task1_has_target:
                 self._task1_phase_start = time.time()
             self._task1_has_target = True
