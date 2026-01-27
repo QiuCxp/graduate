@@ -75,6 +75,14 @@ class HUDRenderer:
         self._task2_trail = []
         self._task2_trail_max = 120
         self._task2_last_point = None
+        # --- Scan showcase animation (all detections, no text) ---
+        self._scan_showcase_start = {1: None, 2: None, 3: None}
+        self._scan_showcase_done = {1: False, 2: False, 3: False}
+        self._scan_showcase_snapshot = {1: None, 2: None, 3: None}
+
+        # duration of showcase after scan line
+        self._scan_showcase_duration = 1.8  # seconds total
+        self._scan_showcase_step = 0.22     # seconds per object highlight
 
     def _get_font(self, size):
         if size in self._font_cache:
@@ -373,7 +381,10 @@ class HUDRenderer:
             return image
 
         h, w = image.shape[:2]
-        
+        # --- 10s buffer: no HUD rendering for Task 2 (VR warm-up) ---
+        if (time.time() - self._task2_enter_time) < 10.0:
+            return image
+
         # 1. Gather Object Data
         cup_info = None
         bottle_info = None
@@ -416,10 +427,7 @@ class HUDRenderer:
         # We relax the threshold from 0.9 to 0.6 to catch "foreshortened" toppled bottles.
         is_toppled = bw > (bh * 0.6)
 
-        # Delay crisis display for VR buffer
-        if is_toppled and (time.time() - self._task2_enter_time) < 10.0:
-            return image
-        
+    
         # --- STAGE 1: CRISIS MODE (Emergency) ---
         if is_toppled:
             # Effect: Red Alert (Stylized)
@@ -514,15 +522,17 @@ class HUDRenderer:
                 self._task2_phase_start = time.time()
             self._task2_has_target = True
 
-            # Timings: scan 3s -> analysis 2s -> confirm
+            # Timings: scan -> showcase -> analysis -> confirm
             delay_t = 0.0
             phase1_t = 3.0
+            showcase_t = self._scan_showcase_duration
             phase2_t = 2.0
             elapsed = 0.0 if self._task2_phase_start is None else (time.time() - self._task2_phase_start)
 
             phase_text = None
             if elapsed < delay_t:
                 phase_text = None
+
             elif elapsed < delay_t + phase1_t:
                 phase_text = "正在扫描桌面"
                 sweep_color = (255, 120, 0)
@@ -533,12 +543,27 @@ class HUDRenderer:
                 else:
                     scan_y = int((1.0 - (t - 0.5) * 2.0) * h)
                 cv2.line(image, (0, scan_y), (w, scan_y), sweep_color, 4, cv2.LINE_AA)
-            elif elapsed < delay_t + phase1_t + phase2_t:
+
+            elif elapsed < delay_t + phase1_t + showcase_t:
+                # --- NEW: Showcase all detections, one-by-one highlight (no text) ---
+                img2, done = self._render_scan_showcase(image, detections, task_id=2)
+                image[:] = img2
+                if done:
+                    self._scan_showcase_done[2] = True
+                return image
+
+            elif elapsed < delay_t + phase1_t + showcase_t + phase2_t:
                 phase_text = "正在分析可放置区域"
+
             else:
                 phase_text = "推荐位置已确认"
                 self._task2_confirmed = True
                 self._task2_scan_done = True
+                # reset showcase state for next entry
+                self._scan_showcase_start[2] = None
+                self._scan_showcase_done[2] = False
+                self._scan_showcase_snapshot[2] = None
+
 
             if phase_text:
                 (tw, th), _ = cv2.getTextSize(phase_text, self.FONT, 1.8, 4)
@@ -732,13 +757,14 @@ class HUDRenderer:
             h_px = int(box[3] * h)
             
             info = {
-                'box': (cx_px, cy_px, w_px, h_px), # Pixel box [cx, cy, w, h]
+                'box': (cx_px, cy_px, w_px, h_px),  # Pixel box [cx, cy, w, h]
                 'norm_box': box,
                 'center': (cx_px, cy_px),
                 'label': label,
-                'polygon': det.get('polygon', [])
+                'polygon': det.get('polygon', []),
+                'det': det, 
             }
-            
+    
             if label == 'cup':
                 # Use cup center as anchor for patient silhouette
                 if cup_info is None or det.get('conf') > cup_info.get('conf', 0):
@@ -948,11 +974,13 @@ class HUDRenderer:
                 ymask = yellow_ring if yellow_ring is not None else yellow_mask
                 hit_yellow = cv2.countNonZero(cv2.bitwise_and(bottle_mask, ymask)) > 0
 
-        # --- SCAN PHASE (no HUD except scan) ---
+        # --- SCAN PHASE (scan line -> showcase -> then enter main task logic) ---
         if not self._task3_scan_done:
             if self._task3_scan_start is None:
                 self._task3_scan_start = time.time()
             scan_elapsed = time.time() - self._task3_scan_start
+
+            # 1) Scan line phase (keep your original)
             if scan_elapsed < 3.0:
                 phase_text = "老人扫描"
                 (tw, th), _ = cv2.getTextSize(phase_text, self.FONT, 1.4, 3)
@@ -960,7 +988,6 @@ class HUDRenderer:
                 text_y = int(h * 0.12)
                 self._put_text(image, phase_text, (text_x, text_y), 1.4, (255, 120, 0), 3)
 
-                # Blue up/down scan line
                 period = 2.0
                 t = (time.time() % period) / period
                 if t <= 0.5:
@@ -969,8 +996,21 @@ class HUDRenderer:
                     scan_y = int((1.0 - (t - 0.5) * 2.0) * h)
                 cv2.line(image, (0, scan_y), (w, scan_y), (255, 120, 0), 4, cv2.LINE_AA)
                 return image
-            else:
-                self._task3_scan_done = True
+
+            # 2) NEW: Showcase all detections after scan line, before entering main logic
+            img2, done = self._render_scan_showcase(image, detections, task_id=3)
+            image[:] = img2
+
+            if not done:
+                return image
+
+            # done == True -> 进入主逻辑
+            self._task3_scan_done = True
+            self._scan_showcase_start[3] = None
+            self._scan_showcase_done[3] = False
+            self._scan_showcase_snapshot[3] = None
+
+
 
         # --- ALERT LOGIC ---
         if hit_yellow or hit_red:
@@ -1007,17 +1047,59 @@ class HUDRenderer:
             cv2.polylines(image, [person_contour], True, (255, 255, 255), 1, cv2.LINE_AA)
 
         # Draw bottle (contour + translucent fill)
-        if bottle_info:
-            det = bottle_info.get('det', {})
-            if det.get('polygon'):
+                # Draw bottle (light purple contour + translucent fill) AFTER patient is detected (PNG exists)
+                # Draw bottle (light purple contour + translucent fill) AFTER patient is detected (PNG exists)
+        if bottle_info and (person_png_overlay is not None) and (person_png_bbox is not None):
+
+            # Light purple (BGR)
+            purple_fill = (255, 140, 255)    # 填充
+            purple_line = (235, 120, 255)    # 轮廓
+
+            # 优先使用 bottle_info 中已经解析好的 polygon
+            poly = bottle_info.get('polygon', [])
+            det  = bottle_info.get('det', {})
+
+            # --- Case 1: 使用 YOLO 分割轮廓 polygon ---
+            if poly and len(poly) >= 3:
                 overlay = image.copy()
-                self._draw_segmentation_fill_custom(overlay, det, w, h, (0, 255, 255))
-                cv2.addWeighted(overlay, 0.25, image, 0.75, 0, image)
+
+                pts = np.array(poly, dtype=np.float32)
+                pts[:, 0] *= w
+                pts[:, 1] *= h
+                pts = pts.astype(np.int32).reshape((-1, 1, 2))
+
+                # 半透明填充
+                cv2.fillPoly(overlay, [pts], purple_fill)
+                cv2.addWeighted(overlay, 0.22, image, 0.78, 0, image)
+
+                # 紫色轮廓
+                cv2.polylines(image, [pts], True, purple_line, 2, cv2.LINE_AA)
+
+            # --- Case 2: 兜底：如果 polygon 没塞进 info，但 det 里还有 ---
+            elif det.get('polygon'):
+                overlay = image.copy()
+                self._draw_segmentation_fill_custom(overlay, det, w, h, purple_fill)
+                cv2.addWeighted(overlay, 0.22, image, 0.78, 0, image)
+
                 pts = np.array(det['polygon'], dtype=np.float32)
                 pts[:, 0] *= w
                 pts[:, 1] *= h
                 pts = pts.astype(np.int32).reshape((-1, 1, 2))
-                cv2.polylines(image, [pts], True, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.polylines(image, [pts], True, purple_line, 2, cv2.LINE_AA)
+
+            # --- Case 3: 最后兜底才画矩形框（理论上你现在应该不会再进这里） ---
+            else:
+                bx, by, bw, bh = bottle_info['box']
+                x1, y1 = bx - bw // 2, by - bh // 2
+                x2, y2 = bx + bw // 2, by + bh // 2
+
+                overlay = image.copy()
+                cv2.rectangle(overlay, (x1, y1), (x2, y2), purple_fill, -1)
+                cv2.addWeighted(overlay, 0.22, image, 0.78, 0, image)
+
+                cv2.rectangle(image, (x1, y1), (x2, y2), purple_line, 2, cv2.LINE_AA)
+
+
 
         # Red warning text
         if hit_red or hit_yellow:
@@ -1229,19 +1311,21 @@ class HUDRenderer:
             if not self._task1_confirmed:
                 elapsed = 0.0 if self._task1_phase_start is None else (time.time() - self._task1_phase_start)
 
-                # Timing: 10s delay -> phase1 3s -> phase2 2s -> confirm
+                 # Timing: delay -> scan line -> showcase -> analysis -> confirm
                 delay_t = 10.0
                 phase1_t = 3.0
+                showcase_t = self._scan_showcase_duration
                 phase2_t = 2.0
 
                 phase_text = None
 
                 if elapsed < delay_t:
                     phase_text = None
+
                 elif elapsed < delay_t + phase1_t:
+                    # --- Scan line phase ---
                     phase_text = "正在扫描桌面"
-                    # full-screen back-and-forth blue sweep line
-                    sweep_color = (255, 120, 0)  # Blue (BGR)
+                    sweep_color = (255, 120, 0)
                     period = 4.0
                     t = (time.time() % period) / period
                     if t <= 0.5:
@@ -1249,11 +1333,27 @@ class HUDRenderer:
                     else:
                         scan_y = int((1.0 - (t - 0.5) * 2.0) * h)
                     cv2.line(image, (0, scan_y), (w, scan_y), sweep_color, 4, cv2.LINE_AA)
-                elif elapsed < delay_t + phase1_t + phase2_t:
+
+                elif elapsed < delay_t + phase1_t + showcase_t:
+                    # --- NEW: Showcase all detections, one-by-one highlight (no text) ---
+                    img2, done = self._render_scan_showcase(image, detections, task_id=1)
+                    image[:] = img2
+                    if done:
+                        self._scan_showcase_done[1] = True
+                    return image
+
+                elif elapsed < delay_t + phase1_t + showcase_t + phase2_t:
+                    # --- Analysis text phase ---
                     phase_text = "正在分析可放置区域"
+
                 else:
                     phase_text = "推荐位置已确认"
                     self._task1_confirmed = True
+                    # reset showcase state for next entry
+                    self._scan_showcase_start[1] = None
+                    self._scan_showcase_done[1] = False
+                    self._scan_showcase_snapshot[1] = None
+
 
                 # Upper-center text (larger, blue)
                 if phase_text:
@@ -1429,6 +1529,93 @@ class HUDRenderer:
             p_right = p_tip - arrow_len * np.array([np.cos(angle + arrow_width), np.sin(angle + arrow_width)])
             cv2.line(img, tuple(p_tip.astype(int)), tuple(p_left.astype(int)), color, 2, cv2.LINE_AA)
             cv2.line(img, tuple(p_tip.astype(int)), tuple(p_right.astype(int)), color, 2, cv2.LINE_AA)
+
+    def _render_scan_showcase(self, image, detections, task_id):
+        """
+        After scan line, show all YOLO detections one-by-one highlight (no text).
+        Uses a frozen snapshot for stability.
+        Returns: (image, done: bool)
+        """
+        if detections is None:
+            return image, True
+
+        # Ensure list-like
+        try:
+            det_list = list(detections)
+        except Exception:
+            det_list = []
+
+        h, w = image.shape[:2]
+
+        # Freeze snapshot at first entry
+        if self._scan_showcase_start.get(task_id) is None:
+            self._scan_showcase_start[task_id] = time.time()
+            self._scan_showcase_snapshot[task_id] = det_list
+
+        snap = self._scan_showcase_snapshot.get(task_id) or []
+        if len(snap) == 0:
+            return image, True
+
+        t = time.time() - self._scan_showcase_start[task_id]
+        if t >= self._scan_showcase_duration:
+            return image, True
+
+        # Which detection to highlight
+        idx = int(t / self._scan_showcase_step) % max(1, len(snap))
+        det_hi = snap[idx]
+
+        # 1) dim the scene slightly (analysis vibe)
+        dim = image.copy()
+        cv2.rectangle(dim, (0, 0), (w, h), (0, 0, 0), -1)
+        cv2.addWeighted(dim, 0.25, image, 0.75, 0, image)
+
+        # 2) draw all detections with light contour (no label)
+        for det in snap:
+            poly = det.get("polygon", []) if isinstance(det, dict) else []
+            box = det.get("box", []) if isinstance(det, dict) else []
+
+            if poly:
+                pts = np.array(poly, dtype=np.float32)
+                if pts.ndim == 2 and pts.shape[1] == 2:
+                    pts[:, 0] *= w
+                    pts[:, 1] *= h
+                    pts = pts.astype(np.int32).reshape((-1, 1, 2))
+                    cv2.polylines(image, [pts], True, (255, 255, 255), 1, cv2.LINE_AA)
+            elif isinstance(box, (list, tuple)) and len(box) == 4:
+                cx, cy, bw, bh = box
+                x1 = int((cx - bw / 2) * w)
+                y1 = int((cy - bh / 2) * h)
+                x2 = int((cx + bw / 2) * w)
+                y2 = int((cy + bh / 2) * h)
+                cv2.rectangle(image, (x1, y1), (x2, y2), (255, 255, 255), 1)
+
+        # 3) highlight one detection with colored translucent fill + thicker contour
+        overlay = image.copy()
+        hi_fill = (255, 120, 0)  # keep consistent with your scan line color
+
+        poly = det_hi.get("polygon", []) if isinstance(det_hi, dict) else []
+        box = det_hi.get("box", []) if isinstance(det_hi, dict) else []
+
+        if poly:
+            pts = np.array(poly, dtype=np.float32)
+            if pts.ndim == 2 and pts.shape[1] == 2:
+                pts[:, 0] *= w
+                pts[:, 1] *= h
+                pts = pts.astype(np.int32).reshape((-1, 1, 2))
+                cv2.fillPoly(overlay, [pts], hi_fill)
+                cv2.addWeighted(overlay, 0.22, image, 0.78, 0, image)
+                cv2.polylines(image, [pts], True, (255, 255, 255), 2, cv2.LINE_AA)
+        elif isinstance(box, (list, tuple)) and len(box) == 4:
+            cx, cy, bw, bh = box
+            x1 = int((cx - bw / 2) * w)
+            y1 = int((cy - bh / 2) * h)
+            x2 = int((cx + bw / 2) * w)
+            y2 = int((cy + bh / 2) * h)
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), hi_fill, -1)
+            cv2.addWeighted(overlay, 0.18, image, 0.82, 0, image)
+            cv2.rectangle(image, (x1, y1), (x2, y2), (255, 255, 255), 2)
+
+        return image, False
 
     def _make_patient_profile_contour(self, cx, cy, pw, ph):
         """Create a simple side-view upper-body silhouette contour.
@@ -1625,5 +1812,8 @@ class HUDRenderer:
         return image
                 
         return image
+                
+
+
                 
 
