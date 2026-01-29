@@ -90,10 +90,19 @@ class HUDRenderer:
         self._depth_scale = 0.001
         self._depth_intrinsics = None
         self._depth_shape = None
-        self._distance_min_m = 0.2
-        self._distance_max_m = 1.2
+        self._distance_min_m = 0.05
+        self._distance_max_m = 0.4
         self._marker_hsv_lower = (18, 80, 140)
         self._marker_hsv_upper = (45, 255, 255)
+        self._depth_cache = {
+            "t": 0.0,
+            "marker": None,
+            "bottle": None,
+            "box": None,
+            "dist_m": None,
+        }
+        self._depth_cache_hold = 0.5
+        self._depth_calc_interval = 0.12
 
     def _get_font(self, size):
         if size in self._font_cache:
@@ -146,14 +155,14 @@ class HUDRenderer:
         roi_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
         roi[:] = roi_bgr
 
-    def render(self, image, detections, task_id=0, depth=None, depth_meta=None): # For legacy compatibility with old entry point name if needed
-        return self.render_main(image, detections, task_id, depth=depth, depth_meta=depth_meta)
+    def render(self, image, detections, task_id=0, depth=None, depth_meta=None, raw_image=None): # For legacy compatibility with old entry point name if needed
+        return self.render_main(image, detections, task_id, depth=depth, depth_meta=depth_meta, raw_image=raw_image)
 
     def draw_hud(self, image, detections):
         # Redirect old method to new logic (default to Task 0)
         return self.render_main(image, detections, task_id=0)
 
-    def render_main(self, image, detections, task_id=0, depth=None, depth_meta=None):
+    def render_main(self, image, detections, task_id=0, depth=None, depth_meta=None, raw_image=None):
         """
         Main render loop.
         task_id: 
@@ -168,15 +177,16 @@ class HUDRenderer:
             self._update_depth_meta(depth_meta, image.shape[:2])
 
         # --- Task Specific Dispatch ---
+        marker_source = raw_image if raw_image is not None else image
         if task_id == 1:
             img = self.render_task_arrange(image, detections)
-            return self._render_depth_distance_overlay(img, detections, depth)
+            return self._render_depth_distance_overlay(img, detections, depth, marker_source)
         elif task_id == 2:
             img = self.render_task_crisis_response(image, detections)
-            return self._render_depth_distance_overlay(img, detections, depth)
+            return self._render_depth_distance_overlay(img, detections, depth, marker_source)
         elif task_id == 3:
             img = self.render_task_human_interaction(image, detections)
-            return self._render_depth_distance_overlay(img, detections, depth)
+            return self._render_depth_distance_overlay(img, detections, depth, marker_source)
 
         # Define relevant objects for each task
         target_labels = []
@@ -514,10 +524,9 @@ class HUDRenderer:
         cx, cy, cw, ch = cup_info['box']
         
         # Generate Isolation Zone (Relative to Cup)
-        # Definition: 20cm (approx 1 Cup width) to the Right (or Left?)
-        # Let's say Right of Cup
+        # Definition: 20cm (approx 1 Cup width) to the Left
         zone_offset = int(cw * 1.5)
-        zone_x = cx + zone_offset
+        zone_x = cx - zone_offset
         zone_y = cy + ch // 2 # Ground level
         zone_w = int(bw * 1.5) # Based on Bottle width
         zone_h = int(bw * 1.0) # Flat elliptical zone
@@ -1201,7 +1210,7 @@ class HUDRenderer:
         elif self._depth_shape is None and image_shape:
             self._depth_shape = (int(image_shape[0]), int(image_shape[1]))
 
-    def _render_depth_distance_overlay(self, image, detections, depth):
+    def _render_depth_distance_overlay(self, image, detections, depth, marker_source):
         if image is None or depth is None or detections is None:
             return image
         if not isinstance(depth, np.ndarray) or depth.ndim < 2:
@@ -1215,11 +1224,23 @@ class HUDRenderer:
             eye_w = w // 2
             eye_offset = 0 if self._depth_eye == "left" else eye_w
 
-        marker_center = self._find_marker_center(image, eye_offset, eye_w)
+        now = time.time()
+        cache = self._depth_cache
+        if cache.get("marker") is not None and (now - cache.get("t", 0.0)) < self._depth_calc_interval:
+            return self._draw_depth_overlay(image, cache["marker"], cache["bottle"], cache["box"], cache["dist_m"])
+
         bottle = self._select_bottle_center(detections, w, h, eye_offset, eye_w)
-        if marker_center is None or bottle is None:
+        if bottle is None:
+            if cache.get("marker") is not None and (now - cache.get("t", 0.0)) < self._depth_cache_hold:
+                return self._draw_depth_overlay(image, cache["marker"], cache["bottle"], cache["box"], cache["dist_m"])
             return image
         bottle_center, bottle_box = bottle
+        source = marker_source if marker_source is not None else image
+        marker_center = self._find_marker_center(source, eye_offset, eye_w)
+        if marker_center is None:
+            if cache.get("marker") is not None and (now - cache.get("t", 0.0)) < self._depth_cache_hold:
+                return self._draw_depth_overlay(image, cache["marker"], cache["bottle"], cache["box"], cache["dist_m"])
+            return image
 
         if self._depth_intrinsics is None:
             self._put_text(image, "深度内参缺失", (10, h - 30), 0.5, (0, 0, 255), 1)
@@ -1228,31 +1249,38 @@ class HUDRenderer:
         z_marker = self._sample_depth(depth, marker_center, (h, w), eye_offset, eye_w)
         z_bottle = self._sample_depth(depth, bottle_center, (h, w), eye_offset, eye_w)
         if z_marker is None or z_bottle is None:
+            if cache.get("marker") is not None and (now - cache.get("t", 0.0)) < self._depth_cache_hold:
+                return self._draw_depth_overlay(image, cache["marker"], cache["bottle"], cache["box"], cache["dist_m"])
             self._put_text(image, "深度不可用", (10, h - 30), 0.5, (0, 0, 255), 1)
             return image
 
         p_marker = self._project_to_3d(marker_center, z_marker, depth.shape[:2], (h, w), eye_offset, eye_w)
         p_bottle = self._project_to_3d(bottle_center, z_bottle, depth.shape[:2], (h, w), eye_offset, eye_w)
         if p_marker is None or p_bottle is None:
+            if cache.get("marker") is not None and (now - cache.get("t", 0.0)) < self._depth_cache_hold:
+                return self._draw_depth_overlay(image, cache["marker"], cache["bottle"], cache["box"], cache["dist_m"])
             return image
 
         dist_m = float(np.linalg.norm(p_marker - p_bottle))
+        cache["t"] = now
+        cache["marker"] = marker_center
+        cache["bottle"] = bottle_center
+        cache["box"] = bottle_box
+        cache["dist_m"] = dist_m
+        return self._draw_depth_overlay(image, marker_center, bottle_center, bottle_box, dist_m)
+
+    def _draw_depth_overlay(self, image, marker_center, bottle_center, bottle_box, dist_m):
+        if marker_center is None or bottle_center is None or bottle_box is None or dist_m is None:
+            return image
         dist_cm = dist_m * 100.0
-
-        # Draw line + points
-        cv2.line(image, marker_center, bottle_center, (0, 255, 255), 2, cv2.LINE_AA)
-        cv2.circle(image, marker_center, 6, (0, 255, 255), -1)
-        cv2.circle(image, bottle_center, 6, (0, 200, 0), -1)
-
-        mid_x = (marker_center[0] + bottle_center[0]) // 2
-        mid_y = (marker_center[1] + bottle_center[1]) // 2
-        self._put_text(image, f"{dist_cm:.1f}cm", (mid_x + 8, mid_y - 8), 0.7, (0, 255, 255), 2)
-
-        # Progress bar near bottle
-        bx, by, bw, bh = bottle_box
-        bar_x = min(w - 20, bx + bw // 2 + 15)
-        bar_y = max(10, by - 60)
-        self._draw_progress_bar(image, (bar_x, bar_y), 12, 120, dist_m)
+        # Ring on arm marker (closer -> smaller ring)
+        ratio = (dist_m - self._distance_min_m) / max(1e-6, (self._distance_max_m - self._distance_min_m))
+        ratio = max(0.0, min(1.0, ratio))
+        max_r = 100
+        min_r = 6
+        ring_r = int(min_r + (max_r - min_r) * ratio)
+        ring_color = (0, 255, int(255 * ratio))
+        cv2.circle(image, marker_center, ring_r, ring_color, 2, cv2.LINE_AA)
         return image
 
     def _find_marker_center(self, image, eye_offset, eye_w):
@@ -1262,7 +1290,12 @@ class HUDRenderer:
         roi = image[:, x1:x2]
         if roi.size == 0:
             return None
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        scale = 0.5 if roi.shape[1] >= 640 else 1.0
+        if scale != 1.0:
+            roi_small = cv2.resize(roi, (int(roi.shape[1] * scale), int(roi.shape[0] * scale)), interpolation=cv2.INTER_AREA)
+        else:
+            roi_small = roi
+        hsv = cv2.cvtColor(roi_small, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, self._marker_hsv_lower, self._marker_hsv_upper)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
@@ -1270,15 +1303,19 @@ class HUDRenderer:
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return None
-        contour = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(contour) < 80:
-            return None
-        m = cv2.moments(contour)
-        if m["m00"] == 0:
-            return None
-        cx = int(m["m10"] / m["m00"]) + x1
-        cy = int(m["m01"] / m["m00"])
-        return (cx, cy)
+        min_area = 80 * (scale * scale)
+        # pick the largest contour not overlapping the exclusion box
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)
+        for contour in contours:
+            if cv2.contourArea(contour) < min_area:
+                continue
+            m = cv2.moments(contour)
+            if m["m00"] == 0:
+                continue
+            cx = int((m["m10"] / m["m00"]) / scale) + x1
+            cy = int((m["m01"] / m["m00"]) / scale)
+            return (cx, cy)
+        return None
 
     def _select_bottle_center(self, detections, image_w, image_h, eye_offset, eye_w):
         best = None

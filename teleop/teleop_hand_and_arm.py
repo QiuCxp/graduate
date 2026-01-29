@@ -415,8 +415,12 @@ if __name__ == '__main__':
         
         # Cache for latest detections
         latest_detections = []
+        last_detection_time = 0.0
         last_log_time = 0
         last_head_depth = None
+        last_hud_frame = None
+        last_hud_time = 0.0
+        hud_interval = 1.0 / 15.0
 
         # main loop. robot start to follow VR user's motion
         while not STOP:
@@ -425,7 +429,12 @@ if __name__ == '__main__':
             # 1. Get Visual Detections (Non-blocking)
             raw_data = vision_client.get_latest_raw_data()
             if raw_data is not None:
-                latest_detections = raw_data
+                if len(raw_data) > 0:
+                    latest_detections = raw_data
+                    last_detection_time = time.time()
+                else:
+                    if time.time() - last_detection_time > 0.3:
+                        latest_detections = []
 
             # 2. Get Images
             head_img = None
@@ -449,10 +458,16 @@ if __name__ == '__main__':
 
                 if xr_need_local_img and head_img is not None:
                     # [Science Fiction HUD]
-                    # Delegate all drawing to the dedicated HUD renderer, passing the currently selected task
-                    # IMPORTANT: Capture the return value, as render might return a processed copy
-                    head_img = hud_renderer.render(head_img, latest_detections, task_id=CURRENT_TASK_ID,
-                                                   depth=head_depth, depth_meta=head_depth_meta)
+                    # Throttle HUD rendering for performance; reuse last overlay between frames
+                    now = time.time()
+                    if last_hud_frame is None or (now - last_hud_time) >= hud_interval:
+                        raw_head = head_img.copy()
+                        head_img = hud_renderer.render(head_img, latest_detections, task_id=CURRENT_TASK_ID,
+                                                       depth=head_depth, depth_meta=head_depth_meta, raw_image=raw_head)
+                        last_hud_frame = head_img
+                        last_hud_time = now
+                    else:
+                        head_img = last_hud_frame
 
                     # [Task Notification] - Keep showing what task we are in persistently or briefly?
                     # The render() function might now handle general UI, but if we need a pop-up:
