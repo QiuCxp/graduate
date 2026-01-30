@@ -465,9 +465,9 @@ if __name__ == "__main__":
                 if tele_data.left_ctrl_thumbstick and tele_data.right_ctrl_thumbstick:
                     loco_wrapper.Damp()
                 loco_wrapper.Move(
-                    -tele_data.left_ctrl_thumbstickValue[1] * 0.3,
-                    -tele_data.left_ctrl_thumbstickValue[0] * 0.3,
-                    -tele_data.right_ctrl_thumbstickValue[0] * 0.3,
+                    -tele_data.left_ctrl_thumbstickValue[1] * 0.2,
+                    -tele_data.left_ctrl_thumbstickValue[0] * 0.2,
+                    -tele_data.right_ctrl_thumbstickValue[0] * 0.2,
                 )
 
             # robot arm state
@@ -500,9 +500,9 @@ if __name__ == "__main__":
                     current_body_state = arm_ctrl.get_current_motor_q().tolist() if (args.input_mode == "controller" and args.motion) else []
                     current_body_action = (
                         [
-                            -tele_data.left_ctrl_thumbstickValue[1] * 0.3,
-                            -tele_data.left_ctrl_thumbstickValue[0] * 0.3,
-                            -tele_data.right_ctrl_thumbstickValue[0] * 0.3,
+                            -tele_data.left_ctrl_thumbstickValue[1] * 0.2,
+                            -tele_data.left_ctrl_thumbstickValue[0] * 0.2,
+                            -tele_data.right_ctrl_thumbstickValue[0] * 0.2,
                         ]
                         if (args.input_mode == "controller" and args.motion)
                         else []
@@ -525,9 +525,9 @@ if __name__ == "__main__":
                         right_hand_action = [dual_gripper_action_array[1]]
                     current_body_state = arm_ctrl.get_current_motor_q().tolist()
                     current_body_action = [
-                        -tele_data.left_ctrl_thumbstickValue[1] * 0.3,
-                        -tele_data.left_ctrl_thumbstickValue[0] * 0.3,
-                        -tele_data.right_ctrl_thumbstickValue[0] * 0.3,
+                        -tele_data.left_ctrl_thumbstickValue[1] * 0.2,
+                        -tele_data.left_ctrl_thumbstickValue[0] * 0.2,
+                        -tele_data.right_ctrl_thumbstickValue[0] * 0.2,
                     ]
 
                 elif args.ee in ["inspire_dfx", "inspire_ftp", "brainco"] and args.input_mode == "hand":
