@@ -151,8 +151,10 @@ if __name__ == '__main__':
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1'], default='G1_29', help='Select arm controller')
     parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'brainco'], help='Select end effector controller')
     parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server, used by teleimager and televuer')
-    parser.add_argument('--loco-speed-scale', type=float, default=0.2,
+    parser.add_argument('--loco-speed-scale', type=float, default=0.15,
                         help='Scale for controller-based locomotion speed (translation/rotation)')
+    parser.add_argument('--loco-deadzone', type=float, default=0.1,
+                        help='Deadzone for controller thumbstick values')
     parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
     # mode flags
     parser.add_argument('--motion', action = 'store_true', help = 'Enable motion control mode')
@@ -424,6 +426,11 @@ if __name__ == '__main__':
         last_hud_time = 0.0
         hud_interval = 1.0 / 15.0
 
+        def _apply_deadzone(value: float, deadzone: float) -> float:
+            # Filter small drift around zero to avoid unintended motion.
+            return 0.0 if abs(value) < deadzone else value
+
+        was_loco_active = False
         # main loop. robot start to follow VR user's motion
         while not STOP:
             start_time = time.time()
@@ -510,6 +517,10 @@ if __name__ == '__main__':
 
             # get xr's tele data
             tele_data = tv_wrapper.get_tele_data()
+            left_x = _apply_deadzone(float(tele_data.left_ctrl_thumbstickValue[0]), args.loco_deadzone)
+            left_y = _apply_deadzone(float(tele_data.left_ctrl_thumbstickValue[1]), args.loco_deadzone)
+            right_x = _apply_deadzone(float(tele_data.right_ctrl_thumbstickValue[0]), args.loco_deadzone)
+            loco_active = abs(left_x) > 0.0 or abs(left_y) > 0.0 or abs(right_x) > 0.0
             if (args.ee == "dex3" or args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco") and args.input_mode == "hand":
                 with left_hand_pos_array.get_lock():
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
@@ -553,10 +564,15 @@ if __name__ == '__main__':
                 if tele_data.left_ctrl_thumbstick and tele_data.right_ctrl_thumbstick:
                     loco_wrapper.Damp()
                 # https://github.com/unitreerobotics/xr_teleoperate/issues/135, control, limit velocity to within 0.3
-                # Use a tunable scale to slow down locomotion when using controller input.
-                loco_wrapper.Move(-tele_data.left_ctrl_thumbstickValue[1] * args.loco_speed_scale,
-                                  -tele_data.left_ctrl_thumbstickValue[0] * args.loco_speed_scale,
-                                  -tele_data.right_ctrl_thumbstickValue[0] * args.loco_speed_scale)
+                # Use a tunable scale and deadzone to avoid drift.
+                if not loco_active:
+                    # Always send zero to avoid lingering motion.
+                    loco_wrapper.Move(0.0, 0.0, 0.0)
+                else:
+                    loco_wrapper.Move(-left_y * args.loco_speed_scale,
+                                      -left_x * args.loco_speed_scale,
+                                      -right_x * args.loco_speed_scale)
+                was_loco_active = loco_active
 
             # get current robot state data.
             current_lr_arm_q  = arm_ctrl.get_current_dual_arm_q()
@@ -596,9 +612,9 @@ if __name__ == '__main__':
                         left_hand_action = [dual_gripper_action_array[0]]
                         right_hand_action = [dual_gripper_action_array[1]]
                         current_body_state = arm_ctrl.get_current_motor_q().tolist()
-                        current_body_action = [-tele_data.left_ctrl_thumbstickValue[1]  * args.loco_speed_scale,
-                                               -tele_data.left_ctrl_thumbstickValue[0]  * args.loco_speed_scale,
-                                               -tele_data.right_ctrl_thumbstickValue[0] * args.loco_speed_scale]
+                        current_body_action = [-left_y * args.loco_speed_scale,
+                                               -left_x * args.loco_speed_scale,
+                                               -right_x * args.loco_speed_scale]
                 elif (args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco") and args.input_mode == "hand":
                     with dual_hand_data_lock:
                         left_ee_state = dual_hand_state_array[:6]
